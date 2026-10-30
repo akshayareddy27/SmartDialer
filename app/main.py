@@ -42,10 +42,35 @@ def reset():
     return {"message":"Simulation reset"}
 @app.get("/simulation/scenarios")
 def scenarios():
-    results=[]
-    for label, rate, talk in [("A",.20,120),("B",.50,90),("C",.70,180),("D",.10,240)]:
-        sim=SmartDialer(agent_count=10,answer_rate=rate)
-        started=sim.predictive_pacing()
-        results.append({"scenario":label,"answer_rate":rate,"avg_talk_time_seconds":talk,
-                        "calls_started":len(started),"metrics":sim.metrics()})
-    return {"scenarios":results,"note":"Deterministic rule-based demonstration, not a statistically validated forecast."}
+    results = []
+
+    scenario_data = [
+        ("A", 0.20, 120),
+        ("B", 0.50, 90),
+        ("C", 0.70, 180),
+        ("D", 0.10, 240)
+    ]
+
+    for label, rate, talk in scenario_data:
+        sim = SmartDialer(
+            agent_count=10,
+            answer_rate=rate
+        )
+
+        started = sim.predictive_pacing(
+            avg_talk_time_seconds=talk,
+            pacing_window_seconds=60
+        )
+
+        results.append({
+            "scenario": label,
+            "answer_rate": rate,
+            "avg_talk_time_seconds": talk,
+            "calls_started": len(started),
+            "metrics": sim.metrics()
+        })
+
+    return {
+        "scenarios": results,
+        "note": "Rule-based pacing demonstration using answer rate, average talk time, and a 60-second pacing window."
+    }

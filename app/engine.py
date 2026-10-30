@@ -1,7 +1,27 @@
+from math import ceil 
 from threading import Lock
 from .models import Agent, AgentState, Borrower, CallState
 from .providers.provider_a import ProviderA
+class SafetyController:
+    """Independent component that enforces outbound dialing limits."""
 
+    def decide(self, requested, available_agents, provider_open=False):
+        requested = max(0, int(requested))
+
+        if provider_open:
+            return {
+                "requested": requested,
+                "approved": 0,
+                "reason": "provider_circuit_open"
+            }
+
+        approved = min(requested, max(0, available_agents))
+
+        return {
+            "requested": requested,
+            "approved": approved,
+            "reason": "approved" if approved > 0 else "no_capacity"
+        }
 class SmartDialer:
     """Single-process prototype. Lock protects atomic in-process reservations."""
     def __init__(self, agent_count=3, answer_rate=0.4, provider=None):
@@ -12,6 +32,7 @@ class SmartDialer:
         self.answer_rate = max(0.0, min(1.0, answer_rate))
         self.provider = provider or ProviderA()
         self.safety_log = []
+        self.safety = SafetyController()
         self.provider_failures = 0
         self.provider_open = False
 
@@ -20,58 +41,138 @@ class SmartDialer:
 
     def safety_controller(self, requested):
         with self.lock:
-            approved = max(0, min(int(requested), len(self.available_agents())))
-            self.safety_log.append({"requested": requested, "approved": approved})
-            return approved
+            decision = self.safety.decide(
+                requested=requested,
+                available_agents=len(self.available_agents()),
+                provider_open=self.provider_open
+            )
+
+            self.safety_log.append(decision.copy())
+            return decision["approved"]
 
     def progressive_dial(self):
         return self.start_calls(1)
 
-    def predictive_pacing(self):
+    def predictive_pacing(
+        self,
+        avg_talk_time_seconds=120,
+        pacing_window_seconds=60
+    ):
         free = len(self.available_agents())
-        queued = sum(b.state == "QUEUED" for b in self.borrowers)
-        # Estimate simultaneous answers; hard safety cap is enforced again by allocator.
-        requested = min(queued, round(free * self.answer_rate))
-        return self.start_calls(requested)
+        queued = sum(
+            b.state == "QUEUED" for b in self.borrowers
+        )
 
+        if avg_talk_time_seconds <= 0 or pacing_window_seconds <= 0:
+            return []
+
+        requested = ceil(
+            free
+            * self.answer_rate
+            * pacing_window_seconds
+            / avg_talk_time_seconds
+        )
+
+        requested = min(queued, requested)
+
+        return self.start_calls(requested)
     def start_calls(self, requested):
         started = []
-        # The safety decision and reservation occur in the same critical section.
+
         with self.lock:
-            if self.provider_open:
-                self.safety_log.append({"requested": requested, "approved": 0, "reason": "provider_circuit_open"})
+            decision = self.safety.decide(
+                requested=requested,
+                available_agents=len(self.available_agents()),
+                provider_open=self.provider_open
+            )
+
+            self.safety_log.append(decision.copy())
+            approved = decision["approved"]
+
+            if approved == 0:
                 return []
-            approved = max(0, min(int(requested), len(self.available_agents())))
-            self.safety_log.append({"requested": requested, "approved": approved})
+
             for agent in self.agents.values():
                 if len(started) >= approved:
                     break
+
                 if agent.state != AgentState.AVAILABLE:
                     continue
-                borrower = next((b for b in self.borrowers if b.state == "QUEUED"), None)
+
+                borrower = next(
+                    (b for b in self.borrowers if b.state == "QUEUED"),
+                    None
+                )
+
                 if borrower is None:
                     break
-                agent.state, borrower.state = AgentState.RESERVED, "RESERVED"
-                call = {"id": len(self.calls) + 1, "agent_id": agent.id,
-                        "borrower_id": borrower.id, "state": CallState.RESERVED.value}
+
+                agent.state = AgentState.RESERVED
+                borrower.state = "RESERVED"
+
+                call = {
+                    "id": len(self.calls) + 1,
+                    "agent_id": agent.id,
+                    "borrower_id": borrower.id,
+                    "state": CallState.RESERVED.value
+                }
+
                 self.calls.append(call)
                 started.append(call)
+
         for call in started:
             try:
-                call["provider_result"] = self.provider.initiate_call(call["borrower_id"], call["agent_id"])
+                call["provider_result"] = self.provider.initiate_call(
+                    call["borrower_id"], call["agent_id"]
+                )
+
                 call["state"] = CallState.RINGING.value
                 self.borrowers[call["borrower_id"] - 1].state = "RINGING"
                 self.provider_failures = 0
+
             except Exception as exc:
-                call.update(state=CallState.FAILED.value, error=str(exc))
+                call.update(
+                    state=CallState.FAILED.value,
+                    error=str(exc)
+                )
+
                 with self.lock:
                     self.borrowers[call["borrower_id"] - 1].state = "QUEUED"
                     self.agents[call["agent_id"]].state = AgentState.AVAILABLE
+
                     self.provider_failures += 1
+
                     if self.provider_failures >= 2:
                         self.provider_open = True
-        return started
 
+        return started
+    def process_provider_events(self, call_id, provider_result=None):
+        """Process provider events through the idempotent event handler."""
+
+        with self.lock:
+            call = next(
+                (c for c in self.calls if c["id"] == call_id),
+                None
+            )
+
+            if call is None:
+                return []
+
+            result = provider_result or call.get("provider_result", {})
+
+        events = result.get("events", [])
+        results = []
+
+        for event in events:
+            result = self.handle_event(
+                event_id=event["event_id"],
+                call_id=call_id,
+                status=event["status"]
+            )
+
+            results.append(result)
+
+        return results
     def recover_stale_reservations(self, stale_call_ids):
         """Demo recovery hook: release reservations for calls whose worker lease expired."""
         recovered = []

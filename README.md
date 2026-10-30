@@ -62,3 +62,31 @@ The tests cover progressive dialing, safety capacity, provider failure release, 
 
 ## Limitations (important)
 Crash recovery is demonstrated through an explicit stale-call recovery endpoint; it is not automatic durable lease recovery. The circuit breaker is a simple prototype. The load test is a local smoke test, not a production benchmark. State is in memory and the lock is process-local. Multi-worker production deployment requires durable database transactions, leases/heartbeats and shared idempotency storage.
+## Predictive Pacing Logic
+
+The predictive pacing engine uses:
+- Number of currently available agents
+- Configured borrower answer rate
+- Average talk time
+- Pacing window duration
+- Number of queued borrowers
+
+The requested call count is estimated using:
+
+`requested = ceil(free_agents × answer_rate × pacing_window / average_talk_time)`
+
+The Safety Controller independently applies the hard available-agent capacity limit before calls are allocated.
+
+This is a simplified, rule-based pacing model and does not represent a production-grade statistical prediction system.
+
+## Load Test Results
+
+Local single-process smoke test:
+
+- Progressive dial requests: 1,000
+- Execution time: 0.0055 seconds
+- Reported throughput: approximately 180,502 requests/second
+- Calls initiated: 100
+- Agent utilization: 100%
+
+These results are environment-specific and should not be interpreted as production performance benchmarks.
